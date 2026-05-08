@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=75.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dict-seg"
+version = "1.0.0"
+description = "Batch Chinese word segmentation + word frequency counting with jieba"
+authors = [{ name = "wainshine" }]
+license = { text = "Apache-2.0" }
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "tqdm>=4.0",
+    "click>=8.0",
+    "jieba>=0.42",
+    "beautifulsoup4>=4.12",
+    "charset-normalizer>=3.0",
+]
+
+[project.scripts]
+dict-seg = "dict_seg.__main__:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools]
+packages = ["dict_seg"]
