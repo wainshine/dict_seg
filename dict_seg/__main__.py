@@ -18,8 +18,11 @@ from .pipeline import run_pipeline, merge_wordfreq_files
               help="Enable POS tagging (output word\\tpos\\tfreq).")
 @click.option("--strip-html", is_flag=True, default=False,
               help="Strip HTML tags with BeautifulSoup before segmentation.")
+@click.option("--user-dict", default=None,
+              help="Path to custom jieba dictionary file.")
 @click.option("--force", is_flag=True, default=False,
               help="Overwrite output file if it already exists.")
+@click.version_option(version="1.2.0", prog_name="dict-seg")
 def main(
     input_path: str,
     output: str | None,
@@ -28,6 +31,7 @@ def main(
     min_freq: int,
     pos: bool,
     strip_html: bool,
+    user_dict: str | None,
     force: bool,
 ) -> None:
     """Batch Chinese word segmentation with jieba and word frequency counting.
@@ -46,8 +50,9 @@ def main(
         mem_mb=mem,
         workers=workers,
         min_freq=min_freq,
-        no_pos=not pos,
+        use_pos=pos,
         strip_html=strip_html,
+        user_dict=user_dict,
         force=force,
     )
 
@@ -66,6 +71,7 @@ def main(
               help="Input files have POS column (word\\tpos\\tfreq).")
 @click.option("--force", is_flag=True, default=False,
               help="Overwrite output file if it already exists.")
+@click.version_option(version="1.2.0", prog_name="dict-seg-merge")
 def merge(
     input_path: str,
     output: str | None,
@@ -87,6 +93,6 @@ def merge(
         mem_mb=mem,
         workers=workers,
         min_freq=min_freq,
-        no_pos=not pos,
+        use_pos=pos,
         force=force,
     )

@@ -36,7 +36,7 @@ def _cut_impl(source, use_pos: bool, strip_html: bool,
     cutter = pseg_cut if use_pos else jieba.cut
     if isinstance(source, list):
         if strip_html:
-            source = [_strip_html(''.join(source))]
+            source = [_strip_html('\n'.join(source))]
         for line in source:
             _tokenize(line, cutter, use_pos, counter)
     else:

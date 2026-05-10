@@ -1,13 +1,16 @@
 """Tests for dict_seg — batch Chinese word segmentation + word frequency counting."""
 
 import collections
+import io
 import os
 import tempfile
 
 import pytest
+from click.testing import CliRunner
 
 from dict_seg.config import (
     TEXT_EXTENSIONS, MIN_FREQ, CHUNK_LINES, CHUNKS_PER_BATCH, WORKERS,
+    OUTPUT_FILE_SUFFIX, OUTPUT_FILE_SUFFIX_POS,
 )
 from dict_seg.segment import _is_garbage, cut_and_count, cut_and_count_pos
 from dict_seg.segment import cut_and_count_text, cut_and_count_text_pos
@@ -20,7 +23,9 @@ from dict_seg.pipeline import (
     _has_chinese,
     _write_counter_to_file,
     _make_sort_cmd,
+    _filter_and_sort_final,
 )
+from dict_seg.__main__ import main, merge
 
 
 # ── segment.py tests ──────────────────────────────────────────────
@@ -165,8 +170,7 @@ class TestDetectEncoding:
         f = tmp_path / "bom.txt"
         f.write_bytes(b'\xef\xbb\xbf' + "你好".encode("utf-8"))
         enc = _detect_file_encoding(str(f))
-        # BOM may cause U+FEFF to appear but the encoding should resolve
-        assert enc in ("utf-8", "gb18030")  # either is acceptable
+        assert enc == "utf-8"
 
 
 class TestIsSingleLineFile:
@@ -187,7 +191,7 @@ class TestMergeSortedWordCounts:
         inp = tmp_path / "input.txt"
         out = tmp_path / "output.txt"
         inp.write_text("品牌\t3\n颜色\t2\n颜色\t1\n材质\t5\n", encoding="utf-8")
-        count = _merge_sorted_word_counts(str(inp), str(out), no_pos=True)
+        count = _merge_sorted_word_counts(str(inp), str(out), use_pos=False)
         assert count == 3
         result = out.read_text(encoding="utf-8").strip().split("\n")
         lines = {l.split("\t")[0]: int(l.split("\t")[1]) for l in result}
@@ -199,7 +203,7 @@ class TestMergeSortedWordCounts:
         inp = tmp_path / "input.txt"
         out = tmp_path / "output.txt"
         inp.write_text("品牌\tn\t3\n品牌\tn\t2\n颜色\tn\t5\n", encoding="utf-8")
-        count = _merge_sorted_word_counts(str(inp), str(out), no_pos=False)
+        count = _merge_sorted_word_counts(str(inp), str(out), use_pos=True)
         assert count == 2
         # Output format: word\tpos\tfreq
         result = out.read_text(encoding="utf-8")
@@ -210,14 +214,14 @@ class TestMergeSortedWordCounts:
         inp = tmp_path / "input.txt"
         out = tmp_path / "output.txt"
         inp.write_text("", encoding="utf-8")
-        count = _merge_sorted_word_counts(str(inp), str(out), no_pos=True)
+        count = _merge_sorted_word_counts(str(inp), str(out), use_pos=False)
         assert count == 0
 
     def test_blank_lines_skipped(self, tmp_path):
         inp = tmp_path / "input.txt"
         out = tmp_path / "output.txt"
         inp.write_text("\n\n品牌\t3\n\n颜色\t2\n", encoding="utf-8")
-        count = _merge_sorted_word_counts(str(inp), str(out), no_pos=True)
+        count = _merge_sorted_word_counts(str(inp), str(out), use_pos=False)
         assert count == 2
 
     def test_malformed_line_skipped(self, tmp_path):
@@ -225,7 +229,7 @@ class TestMergeSortedWordCounts:
         out = tmp_path / "output.txt"
         inp.write_text("品牌\t3\nbadline\n颜色\t2\n", encoding="utf-8")
         # len(parts) guard prevents IndexError; malformed line silently skipped
-        count = _merge_sorted_word_counts(str(inp), str(out), no_pos=True)
+        count = _merge_sorted_word_counts(str(inp), str(out), use_pos=False)
         assert count == 2
         result = out.read_text(encoding="utf-8")
         assert "badline" not in result
@@ -235,7 +239,7 @@ class TestWriteCounterToFile:
     def test_no_pos(self, tmp_path):
         counter = collections.Counter({"品牌": 5, "颜色": 3})
         p = tmp_path / "out.txt"
-        _write_counter_to_file(counter, str(p), no_pos=True)
+        _write_counter_to_file(counter, str(p), use_pos=False)
         lines = p.read_text(encoding="utf-8").strip().split("\n")
         assert len(lines) == 2
         assert "\t" in lines[0]
@@ -243,7 +247,7 @@ class TestWriteCounterToFile:
     def test_pos_mode(self, tmp_path):
         counter = collections.Counter({("品牌", "n"): 5, ("颜色", "n"): 3})
         p = tmp_path / "out.txt"
-        _write_counter_to_file(counter, str(p), no_pos=False)
+        _write_counter_to_file(counter, str(p), use_pos=True)
         lines = p.read_text(encoding="utf-8").strip().split("\n")
         assert len(lines) == 2
         # Intermediate format: word\tpos\tfreq
@@ -253,7 +257,7 @@ class TestWriteCounterToFile:
     def test_tab_escaping(self, tmp_path):
         counter = collections.Counter({"wo\trd": 1})
         p = tmp_path / "out.txt"
-        _write_counter_to_file(counter, str(p), no_pos=True)
+        _write_counter_to_file(counter, str(p), use_pos=False)
         line = p.read_text(encoding="utf-8").strip()
         assert line.count("\t") == 1  # only the separator, word tab replaced
         assert "wo rd" in line
@@ -335,7 +339,7 @@ class TestEndToEnd:
 
         f = tmp_path / "corpus.txt"
         f.write_text("测试测试测试测试测试测试\n" * 10, encoding="utf-8")
-        out = run_pipeline(str(f), no_pos=False, workers=1, min_freq=1, force=True)
+        out = run_pipeline(str(f), use_pos=True, workers=1, min_freq=1, force=True)
         assert OUTPUT_FILE_SUFFIX_POS in out
 
     def test_pos_output_format(self, tmp_path):
@@ -343,7 +347,7 @@ class TestEndToEnd:
 
         f = tmp_path / "corpus.txt"
         f.write_text("测试测试测试测试测试测试\n" * 10, encoding="utf-8")
-        out = run_pipeline(str(f), no_pos=False, workers=1, min_freq=1, force=True)
+        out = run_pipeline(str(f), use_pos=True, workers=1, min_freq=1, force=True)
         lines = open(out, encoding="utf-8").readlines()
         assert len(lines) > 0
         # POS format: word\tpos\tfreq (3 columns)
@@ -391,7 +395,7 @@ class TestMergeWordfreq:
         (d / "a_wordfreq.txt").write_text("品牌\tn\t5\n颜色\tn\t3\n", encoding="utf-8")
         (d / "b_wordfreq.txt").write_text("品牌\tn\t2\n材质\tn\t4\n", encoding="utf-8")
 
-        out = merge_wordfreq_files(str(d), no_pos=False, min_freq=1, force=True)
+        out = merge_wordfreq_files(str(d), use_pos=True, min_freq=1, force=True)
         lines = [l.strip().split("\t") for l in open(out, encoding="utf-8")]
         assert len(lines[0]) == 3  # word\tpos\tfreq
 
@@ -404,5 +408,158 @@ class TestMergeWordfreq:
         (d / "a_wordfreq.txt").write_text("品牌\tn\t5\n", encoding="utf-8")
         (d / "b_wordfreq.txt").write_text("品牌\tn\t2\n", encoding="utf-8")
 
-        out = merge_wordfreq_files(str(d), no_pos=False, min_freq=1, force=True)
+        out = merge_wordfreq_files(str(d), use_pos=True, min_freq=1, force=True)
         assert OUTPUT_FILE_SUFFIX_POS in out
+
+    def test_merge_e2e_pos(self, tmp_path):
+        from dict_seg.pipeline import merge_wordfreq_files
+
+        d = tmp_path / "freqs"
+        d.mkdir()
+        (d / "a_wordfreq.txt").write_text("品牌\tn\t5\n颜色\tn\t3\n", encoding="utf-8")
+        (d / "b_wordfreq.txt").write_text("品牌\tn\t2\n材质\tn\t4\n", encoding="utf-8")
+
+        out = merge_wordfreq_files(str(d), use_pos=True, min_freq=1, force=True)
+        assert os.path.exists(out)
+        for line in open(out, encoding="utf-8"):
+            cols = line.strip().split("\t")
+            assert len(cols) == 3  # word\tpos\tfreq
+
+    def test_merge_no_overwrite(self, tmp_path):
+        from dict_seg.pipeline import merge_wordfreq_files
+
+        d = tmp_path / "freqs"
+        d.mkdir()
+        (d / "a_wordfreq.txt").write_text("品牌\t5\n", encoding="utf-8")
+        (d / "b_wordfreq.txt").write_text("颜色\t3\n", encoding="utf-8")
+        existing = d / "merged_wordfreq.txt"
+        existing.write_text("preserve", encoding="utf-8")
+
+        merge_wordfreq_files(str(d), output_path=str(existing), force=False)
+        assert existing.read_text(encoding="utf-8") == "preserve"
+
+    def test_merge_force_overwrite(self, tmp_path):
+        from dict_seg.pipeline import merge_wordfreq_files
+
+        d = tmp_path / "freqs"
+        d.mkdir()
+        (d / "a_wordfreq.txt").write_text("品牌\t5\n", encoding="utf-8")
+        (d / "b_wordfreq.txt").write_text("颜色\t3\n", encoding="utf-8")
+        out = d / "merged_wordfreq.txt"
+        out.write_text("existing", encoding="utf-8")
+
+        merge_wordfreq_files(str(d), output_path=str(out), force=True)
+        content = out.read_text(encoding="utf-8")
+        assert "品牌" in content
+        assert "existing" not in content
+
+
+class TestStripHtmlPosIntegration:
+    def test_strip_html_pos(self, tmp_path):
+        from dict_seg.pipeline import run_pipeline
+
+        f = tmp_path / "corpus.html"
+        f.write_text("<html><body><p>品牌品牌品牌品牌品牌</p><script>var x=1;</script></body></html>\n" * 5,
+                     encoding="utf-8")
+        out = run_pipeline(str(f), use_pos=True, strip_html=True, workers=1,
+                           min_freq=1, force=True)
+        content = open(out, encoding="utf-8").read()
+        assert "品牌" in content
+        assert "var" not in content
+        assert "script" not in content
+
+
+class TestFilterAndSortFinal:
+    def test_malformed_freq_tolerated(self, tmp_path):
+        inp = tmp_path / "input.txt"
+        out = tmp_path / "output.txt"
+        inp.write_text("品牌\t5\nbadfreq_line\n颜色\t3\n材质\tabc\n", encoding="utf-8")
+        _filter_and_sort_final(str(inp), str(out), str(tmp_path),
+                               min_freq=1, use_pos=False, mem_mb=64, workers=1)
+        result = out.read_text(encoding="utf-8")
+        assert "品牌" in result
+        assert "颜色" in result
+        assert "badfreq" not in result
+        assert "abc" not in result
+
+    def test_min_freq_filter_applied(self, tmp_path):
+        inp = tmp_path / "input.txt"
+        out = tmp_path / "output.txt"
+        inp.write_text("品牌\t5\n颜色\t2\n材质\t1\n", encoding="utf-8")
+        _filter_and_sort_final(str(inp), str(out), str(tmp_path),
+                               min_freq=3, use_pos=False, mem_mb=64, workers=1)
+        result = out.read_text(encoding="utf-8")
+        assert "品牌" in result
+        assert "颜色" not in result
+        assert "材质" not in result
+
+    def test_pos_format(self, tmp_path):
+        inp = tmp_path / "input.txt"
+        out = tmp_path / "output.txt"
+        inp.write_text("品牌\tn\t5\n颜色\tn\t3\n", encoding="utf-8")
+        _filter_and_sort_final(str(inp), str(out), str(tmp_path),
+                               min_freq=1, use_pos=True, mem_mb=64, workers=1)
+        lines = out.read_text(encoding="utf-8").strip().split("\n")
+        cols = lines[0].split("\t")
+        assert len(cols) == 3
+
+
+class TestIsSingleLineFileCap:
+    def test_large_file_0_newlines_capped(self, monkeypatch):
+        def fake_open(path, mode):
+            return io.BytesIO(b"x" * (500 * 1024 * 1024))
+        monkeypatch.setattr("builtins.open", fake_open)
+        monkeypatch.setattr("os.path.getsize", lambda p: 800 * 1024 * 1024)
+        assert _is_single_line_file("/fake/large.bin")
+
+    def test_large_file_many_newlines_early(self, monkeypatch):
+        data = (b"a" * 1000 + b"\n") * 100
+        def fake_open(path, mode):
+            return io.BytesIO(data)
+        monkeypatch.setattr("builtins.open", fake_open)
+        monkeypatch.setattr("os.path.getsize", lambda p: 800 * 1024 * 1024)
+        assert not _is_single_line_file("/fake/large.bin")
+
+
+class TestCLI:
+    def test_version(self):
+        runner = CliRunner()
+        result = runner.invoke(main, ["--version"])
+        assert result.exit_code == 0
+        assert "1.2.0" in result.output
+
+    def test_merge_version(self):
+        runner = CliRunner()
+        result = runner.invoke(merge, ["--version"])
+        assert result.exit_code == 0
+        assert "1.2.0" in result.output
+
+    def test_user_dict(self, tmp_path):
+        corpus = tmp_path / "corpus.txt"
+        corpus.write_text("自然语言处理很有趣\n" * 50, encoding="utf-8")
+        user_dict = tmp_path / "user_dict.txt"
+        user_dict.write_text("自然语言处理 100\n", encoding="utf-8")
+        out = tmp_path / "out.txt"
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            str(corpus), "-o", str(out), "-w", "1", "--min-freq", "1",
+            "--user-dict", str(user_dict), "--force",
+        ])
+        assert result.exit_code == 0
+        content = out.read_text(encoding="utf-8")
+        assert "自然语言处理" in content
+
+    def test_user_dict_pos(self, tmp_path):
+        corpus = tmp_path / "corpus.txt"
+        corpus.write_text("自然语言处理很有趣\n" * 50, encoding="utf-8")
+        user_dict = tmp_path / "user_dict.txt"
+        user_dict.write_text("自然语言处理 100\n", encoding="utf-8")
+        out = tmp_path / "out.txt"
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            str(corpus), "-o", str(out), "-w", "1", "--min-freq", "1",
+            "--user-dict", str(user_dict), "--pos", "--force",
+        ])
+        assert result.exit_code == 0
+        content = out.read_text(encoding="utf-8")
+        assert "自然语言处理" in content

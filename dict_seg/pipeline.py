@@ -23,6 +23,7 @@ from .segment import cut_and_count_text, cut_and_count_text_pos
 _SORT_BIN = "gsort" if shutil.which("gsort") else "sort"
 _SORT_IS_GNU = _SORT_BIN == "gsort"
 _CHINESE_RE = re.compile(r"[\u4E00-\u9FFF]")
+_WORKER_TIMEOUT = 600
 
 _running_sorts: list[subprocess.Popen] = []
 
@@ -46,15 +47,65 @@ def _kill_running_sorts():
                 p.wait(timeout=2)
             except Exception:
                 pass
+    _running_sorts.clear()
 
 
-def _segment_worker(args):
-    lines, tmp_path, no_pos, strip_html = args
-    if no_pos:
+def _monitor_sort_progress(p: subprocess.Popen, output_path: str,
+                           input_path: str, label: str = "Sorting") -> None:
+    in_size = os.path.getsize(input_path)
+    t0 = time.time()
+    while p.poll() is None:
+        out_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+        pct = out_size / in_size * 100 if in_size > 0 else 0
+        elapsed = time.time() - t0
+        print(f"\r    {label}... {pct:.0f}% ({elapsed:.0f}s)",
+              end="", flush=True)
+        time.sleep(3)
+    elapsed = time.time() - t0
+    print(f"\r    {label}... 100% ({elapsed:.0f}s)", flush=True)
+
+
+def _filter_and_sort_final(merged_path: str, output_path: str,
+                           temp_dir: str, min_freq: int, use_pos: bool,
+                           mem_mb: int, workers: int) -> None:
+    print(f"  Filtering Chinese-only, min_freq >= {min_freq}...")
+    filtered_path = os.path.join(temp_dir, "filtered.txt")
+    with open(merged_path, "r", encoding="utf-8") as fin, \
+         open(filtered_path, "w", encoding="utf-8") as fout:
+        for line in fin:
+            parts = line.rstrip("\n\r").split("\t")
+            w = parts[0]
+            freq_s = parts[-1]
+            try:
+                if int(freq_s) < min_freq:
+                    continue
+            except ValueError:
+                continue
+            if not _has_chinese(w):
+                continue
+            fout.write(line)
+
+    print("  Sorting by frequency descending...")
+    sort_key = "-k2,2" if not use_pos else "-k3,3"
+    subprocess.run(
+        _make_sort_cmd(mem_mb, workers,
+                       "-t", "\t", sort_key, "-nr",
+                       "-o", output_path, filtered_path),
+        check=True,
+        env={**os.environ, "LC_ALL": "C"},
+    )
+
+
+def _segment_worker(args: tuple[list[str], str, bool, bool, str | None]) -> None:
+    lines, tmp_path, use_pos, strip_html, user_dict = args
+    if user_dict:
+        import jieba
+        jieba.load_userdict(user_dict)
+    if not use_pos:
         counter = cut_and_count(lines, strip_html=strip_html)
     else:
         counter = cut_and_count_pos(lines, strip_html=strip_html)
-    _write_counter_to_file(counter, tmp_path, no_pos)
+    _write_counter_to_file(counter, tmp_path, use_pos)
 
 
 # ── File collection ──────────────────────────────────────────────
@@ -143,12 +194,15 @@ def _is_single_line_file(filepath: str) -> bool:
     size = os.path.getsize(filepath)
     if size < 100 * 1024 * 1024:
         return False
+    max_probe = 500 * 1024 * 1024
     with open(filepath, "rb") as f:
         count = 0
-        while True:
+        bytes_read = 0
+        while bytes_read < max_probe:
             data = f.read(4 * 1024 * 1024)
             if not data:
                 break
+            bytes_read += len(data)
             count += data.count(b"\n")
             if count > 10:
                 return False
@@ -157,7 +211,7 @@ def _is_single_line_file(filepath: str) -> bool:
 
 # ── Multi-line chunked read ──────────────────────────────────────
 
-def _read_chunks_by_lines(path: str, n: int, encoding: str = "utf-8"):
+def _read_chunks_by_lines(path: str, n: int, encoding: str = "utf-8") -> "collections.abc.Generator[list[str], None, None]":
     chunk: list[str] = []
     with open(path, "r", encoding=encoding, errors="replace") as f:
         for line in f:
@@ -171,9 +225,9 @@ def _read_chunks_by_lines(path: str, n: int, encoding: str = "utf-8"):
 
 # ── Temp file I/O ────────────────────────────────────────────────
 
-def _write_counter_to_file(counter, path: str, no_pos: bool = False) -> None:
+def _write_counter_to_file(counter: "collections.Counter", path: str, use_pos: bool = True) -> None:
     with open(path, "w", encoding="utf-8") as f:
-        if no_pos:
+        if not use_pos:
             for w, c in counter.items():
                 w = w.replace("\t", " ").replace("\n", " ").replace("\r", " ")
                 f.write(f"{w}\t{c}\n")
@@ -199,7 +253,7 @@ def _has_chinese(word: str) -> bool:
 # ── Merge sorted word-count files ────────────────────────────────
 
 def _merge_sorted_word_counts(input_path: str, output_path: str,
-                              no_pos: bool = False) -> int:
+                              use_pos: bool = True) -> int:
     count = 0
     with open(input_path, "r", encoding="utf-8") as fin, \
          open(output_path, "w", encoding="utf-8") as fout:
@@ -212,7 +266,7 @@ def _merge_sorted_word_counts(input_path: str, output_path: str,
                 continue
             parts = line.split("\t")
             word = parts[0]
-            if no_pos:
+            if not use_pos:
                 if len(parts) < 2:
                     continue
                 freq = int(parts[1])
@@ -241,10 +295,10 @@ def _merge_sorted_word_counts(input_path: str, output_path: str,
                     total_freq = cnt
                     pos_counts = {pos: cnt}
         if prev_word is not None:
-            if no_pos:
+            if not use_pos:
                 fout.write(f"{prev_word}\t{total_freq}\n")
             else:
-                best_pos = max(pos_counts, key=pos_counts.get)
+                best_pos = max(pos_counts, key=pos_counts.get) if pos_counts else "?"
                 fout.write(f"{prev_word}\t{best_pos}\t{total_freq}\n")
             count += 1
     return count
@@ -258,13 +312,17 @@ def run_pipeline(
     mem_mb: int = DEFAULT_MEM_MB,
     workers: int = WORKERS,
     min_freq: int = MIN_FREQ,
-    no_pos: bool = True,
+    use_pos: bool = False,
     strip_html: bool = False,
+    user_dict: str | None = None,
     force: bool = False,
 ) -> str:
     # Use spawn on macOS (fork can deadlock with jieba.posseg)
     if sys.platform == "darwin":
         set_start_method("spawn", force=True)
+    if user_dict:
+        import jieba
+        jieba.load_userdict(user_dict)
     txt_files = _collect_files(input_path)
     # Exclude existing wordfreq output so it doesn't feed back in
     txt_files = [f for f in txt_files
@@ -275,7 +333,7 @@ def run_pipeline(
 
     if output_path is None:
         output_path = _make_output_path(input_path,
-                                         OUTPUT_FILE_SUFFIX_POS if not no_pos else None)
+                                         OUTPUT_FILE_SUFFIX_POS if use_pos else None)
     if os.path.exists(output_path) and not force:
         print(f"  Output exists: {output_path}. Use --force to overwrite.")
         return output_path
@@ -296,11 +354,30 @@ def run_pipeline(
         if normal_files:
             total_chunks = 0
             file_encodings: dict[str, str] = {}
+            failed_files: list[str] = []
             for fp in normal_files:
-                enc = _detect_file_encoding(fp)
+                try:
+                    enc = _detect_file_encoding(fp)
+                except Exception:
+                    print(f"  WARNING: Cannot detect encoding for {fp}, skipping.")
+                    failed_files.append(fp)
+                    continue
                 file_encodings[fp] = enc
-                est_lines = max(1, os.path.getsize(fp) // 100)
+                size = os.path.getsize(fp)
+                est_lines = max(1, size // 200)
+                try:
+                    with open(fp, "rb") as sf:
+                        head = sf.read(65536)
+                except Exception:
+                    head = b""
+                if head:
+                    nl = head.count(b"\n")
+                    if nl >= 5:
+                        est_lines = max(1, int(size * nl / len(head)))
                 total_chunks += (est_lines + CHUNK_LINES - 1) // CHUNK_LINES
+
+            if failed_files:
+                normal_files = [f for f in normal_files if f not in failed_files]
 
             max_pending = workers * 4
 
@@ -314,8 +391,13 @@ def run_pipeline(
 
                 for fp in normal_files:
                     enc = file_encodings[fp]
-                    for chunk in _read_chunks_by_lines(fp, CHUNK_LINES,
-                                                       encoding=enc):
+                    try:
+                        chunks_iter = _read_chunks_by_lines(fp, CHUNK_LINES,
+                                                            encoding=enc)
+                    except Exception:
+                        print(f"  WARNING: Cannot read {fp}, skipping.")
+                        continue
+                    for chunk in chunks_iter:
                         batch_lines.extend(chunk)
                         batch_chunks += 1
 
@@ -326,13 +408,13 @@ def run_pipeline(
                             batch_id += 1
 
                             if len(futures) >= max_pending:
-                                futures.popleft().get()
+                                futures.popleft().get(timeout=_WORKER_TIMEOUT)
                                 pbar.update(chunks_per_task.popleft())
 
                             futures.append(pool.apply_async(
                                 _segment_worker,
-                                ((batch_lines, tmp_path, no_pos,
-                                  strip_html),),
+                                ((batch_lines, tmp_path, use_pos,
+                                  strip_html, user_dict),),
                             ))
                             chunks_per_task.append(batch_chunks)
                             batch_lines = []
@@ -345,13 +427,14 @@ def run_pipeline(
                     batch_id += 1
                     futures.append(pool.apply_async(
                         _segment_worker,
-                        ((batch_lines, tmp_path, no_pos, strip_html),),
+                        ((batch_lines, tmp_path, use_pos, strip_html,
+                          user_dict),),
                     ))
                     chunks_per_task.append(batch_chunks)
 
                 for fut, n in zip(futures, chunks_per_task):
                     try:
-                        fut.get()
+                        fut.get(timeout=_WORKER_TIMEOUT)
                     except Exception:
                         pool.terminate()
                         raise
@@ -359,17 +442,20 @@ def run_pipeline(
                 pbar.close()
 
         for hf in huge_files:
-            print(f"  Single-line mode: {os.path.basename(hf)} "
-                  f"({os.path.getsize(hf) / 1e9:.1f} GB)")
-            sl_tmp, batch_id = _process_single_line_file(
-                hf, chunk_tmp_dir, batch_id, no_pos, strip_html)
-            tmp_paths.extend(sl_tmp)
+            try:
+                print(f"  Single-line mode: {os.path.basename(hf)} "
+                      f"({os.path.getsize(hf) / 1e9:.1f} GB)")
+                sl_tmp, batch_id = _process_single_line_file(
+                    hf, chunk_tmp_dir, batch_id, use_pos, strip_html)
+                tmp_paths.extend(sl_tmp)
+            except Exception:
+                print(f"  WARNING: Failed processing {hf}, skipping.")
 
         # ── Stage 2: Concat + sort + merge ───────────────────────
         if not tmp_paths:
             print("  No content to process.")
             with open(output_path, "w", encoding="utf-8") as f:
-                if no_pos:
+                if not use_pos:
                     f.write("word\tfreq\n")
                 else:
                     f.write("word\tpos\tfreq\n")
@@ -393,23 +479,10 @@ def run_pipeline(
             stderr=subprocess.PIPE, text=True, env=sort_env)
         _running_sorts.append(p)
 
-        in_size = total_intermediate
-
-        def _monitor():
-            while p.poll() is None:
-                out_size = (
-                    os.path.getsize(merged_path)
-                    if os.path.exists(merged_path) else 0
-                )
-                pct = out_size / in_size * 100 if in_size > 0 else 0
-                e = time.time() - _monitor.t0
-                print(f"\r    Sorting... {pct:.0f}% ({e:.0f}s)",
-                      end="", flush=True)
-                time.sleep(3)
-            e = time.time() - _monitor.t0
-            print(f"\r    Sorting... 100% ({e:.0f}s)", flush=True)
-        _monitor.t0 = time.time()
-        t = threading.Thread(target=_monitor, daemon=True)
+        t = threading.Thread(
+            target=_monitor_sort_progress,
+            args=(p, merged_path, merged_unsorted, "Sorting"),
+            daemon=True)
         t.start()
 
         _, stderr = p.communicate()
@@ -425,33 +498,11 @@ def run_pipeline(
         print("  Merging same-word counts...")
         merged_unsorted2 = os.path.join(temp_dir, "merged_unsorted2.txt")
         word_count = _merge_sorted_word_counts(merged_path, merged_unsorted2,
-                                               no_pos)
+                                               use_pos)
         print(f"  Unique words after merge: {word_count}")
 
-        # ── Stage 3: Filter + sort by freq desc ──────────────────
-        print(f"  Filtering Chinese-only, min_freq >= {min_freq}...")
-        filtered_path = os.path.join(temp_dir, "filtered.txt")
-        with open(merged_unsorted2, "r", encoding="utf-8") as fin, \
-             open(filtered_path, "w", encoding="utf-8") as fout:
-            for line in fin:
-                parts = line.rstrip("\n\r").split("\t")
-                w = parts[0]
-                freq_s = parts[-1]  # last column is always freq
-                if int(freq_s) < min_freq:
-                    continue
-                if not _has_chinese(w):
-                    continue
-                fout.write(line)
-
-        print("  Sorting by frequency descending...")
-        sort_key = "-k2,2" if no_pos else "-k3,3"
-        subprocess.run(
-            _make_sort_cmd(mem_mb, workers,
-                           "-t", "\t", sort_key, "-nr",
-                           "-o", output_path, filtered_path),
-            check=True,
-            env={**os.environ, "LC_ALL": "C"},
-        )
+        _filter_and_sort_final(merged_unsorted2, output_path, temp_dir,
+                               min_freq, use_pos, mem_mb, workers)
 
         print(f"Done: {output_path}")
         return output_path
@@ -469,7 +520,7 @@ def merge_wordfreq_files(
     mem_mb: int = DEFAULT_MEM_MB,
     workers: int = WORKERS,
     min_freq: int = MIN_FREQ,
-    no_pos: bool = True,
+    use_pos: bool = False,
     force: bool = False,
 ) -> str:
     """Merge multiple _wordfreq.txt files from a directory into one.
@@ -493,7 +544,7 @@ def merge_wordfreq_files(
 
     if output_path is None:
         today = date.today().strftime("%Y%m%d")
-        suf = OUTPUT_FILE_SUFFIX_POS if not no_pos else OUTPUT_FILE_SUFFIX
+        suf = OUTPUT_FILE_SUFFIX_POS if use_pos else OUTPUT_FILE_SUFFIX
         output_path = os.path.join(input_path, f"merged_{today}_{suf}")
 
     if os.path.exists(output_path) and not force:
@@ -518,7 +569,15 @@ def merge_wordfreq_files(
                            "-o", merged_path, merged_unsorted),
             stderr=subprocess.PIPE, text=True, env=sort_env)
         _running_sorts.append(p)
+
+        mt = threading.Thread(
+            target=_monitor_sort_progress,
+            args=(p, merged_path, merged_unsorted, "Sorting"),
+            daemon=True)
+        mt.start()
+
         _, stderr = p.communicate()
+        mt.join(timeout=1)
         if p.returncode != 0:
             raise RuntimeError(f"Sort failed: {stderr}")
 
@@ -530,32 +589,11 @@ def merge_wordfreq_files(
         print("  Merging same-word counts...")
         merged_unsorted2 = os.path.join(temp_dir, "merged_unsorted2.txt")
         word_count = _merge_sorted_word_counts(merged_path, merged_unsorted2,
-                                               no_pos)
+                                               use_pos)
         print(f"  Unique words after merge: {word_count}")
 
-        print(f"  Filtering Chinese-only, min_freq >= {min_freq}...")
-        filtered_path = os.path.join(temp_dir, "filtered.txt")
-        with open(merged_unsorted2, "r", encoding="utf-8") as fin, \
-             open(filtered_path, "w", encoding="utf-8") as fout:
-            for line in fin:
-                parts = line.rstrip("\n\r").split("\t")
-                w = parts[0]
-                freq_s = parts[-1]  # last column is always freq
-                if int(freq_s) < min_freq:
-                    continue
-                if not _has_chinese(w):
-                    continue
-                fout.write(line)
-
-        print("  Sorting by frequency descending...")
-        sort_key = "-k2,2" if no_pos else "-k3,3"
-        subprocess.run(
-            _make_sort_cmd(mem_mb, workers,
-                           "-t", "\t", sort_key, "-nr",
-                           "-o", output_path, filtered_path),
-            check=True,
-            env={**os.environ, "LC_ALL": "C"},
-        )
+        _filter_and_sort_final(merged_unsorted2, output_path, temp_dir,
+                               min_freq, use_pos, mem_mb, workers)
 
         print(f"Done: {output_path}")
         return output_path
@@ -571,19 +609,26 @@ def _process_single_line_file(
     filepath: str,
     chunk_tmp_dir: str,
     start_id: int,
-    no_pos: bool,
+    use_pos: bool,
     strip_html: bool,
 ) -> tuple[list[str], int]:
     encoding = _detect_file_encoding(filepath)
     total_bytes = os.path.getsize(filepath)
+    bytes_per_char = 2 if encoding in ("gb18030", "gbk", "big5") else 3
+    with open(filepath, "rb") as sf:
+        probe = sf.read(BYTE_BUF)
+    if probe:
+        char_count = len(probe.decode(encoding, errors="replace"))
+        if char_count > 0:
+            bytes_per_char = max(1, total_bytes // char_count)
     total_chunks = (
-        total_bytes // (SINGLE_LINE_CHAR_CHUNK * 3) + 1
+        total_bytes // (SINGLE_LINE_CHAR_CHUNK * bytes_per_char) + 1
     )
 
     tmp_paths: list[str] = []
     pbar = tqdm.tqdm(total=total_chunks, desc="  S-line", unit="chunk")
 
-    cut_func = cut_and_count_text if no_pos else cut_and_count_text_pos
+    cut_func = cut_and_count_text if not use_pos else cut_and_count_text_pos
     carryover = b""
     batch_id = start_id
     with open(filepath, "rb") as fin:
@@ -595,7 +640,7 @@ def _process_single_line_file(
                     counter = cut_func(text, strip_html=strip_html)
                     tmp_path = os.path.join(
                         chunk_tmp_dir, f"chunk_{batch_id:06d}.txt")
-                    _write_counter_to_file(counter, tmp_path, no_pos)
+                    _write_counter_to_file(counter, tmp_path, use_pos)
                     tmp_paths.append(tmp_path)
                     pbar.update(1)
                 break
@@ -621,7 +666,7 @@ def _process_single_line_file(
                 counter = cut_func(sub, strip_html=strip_html)
                 tmp_path = os.path.join(
                     chunk_tmp_dir, f"chunk_{batch_id:06d}.txt")
-                _write_counter_to_file(counter, tmp_path, no_pos)
+                _write_counter_to_file(counter, tmp_path, use_pos)
                 tmp_paths.append(tmp_path)
                 batch_id += 1
                 pbar.update(1)
