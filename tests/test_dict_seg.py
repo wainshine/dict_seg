@@ -201,6 +201,10 @@ class TestMergeSortedWordCounts:
         inp.write_text("品牌\tn\t3\n品牌\tn\t2\n颜色\tn\t5\n", encoding="utf-8")
         count = _merge_sorted_word_counts(str(inp), str(out), no_pos=False)
         assert count == 2
+        # Output format: word\tpos\tfreq
+        result = out.read_text(encoding="utf-8")
+        assert "品牌\tn\t5" in result
+        assert "颜色\tn\t5" in result
 
     def test_empty_input(self, tmp_path):
         inp = tmp_path / "input.txt"
@@ -242,7 +246,9 @@ class TestWriteCounterToFile:
         _write_counter_to_file(counter, str(p), no_pos=False)
         lines = p.read_text(encoding="utf-8").strip().split("\n")
         assert len(lines) == 2
-        assert lines[0].count("\t") == 2  # word \t pos \t freq
+        # Intermediate format: word\tpos\tfreq
+        assert lines[0].count("\t") == 2
+        assert "\t" in lines[0]
 
     def test_tab_escaping(self, tmp_path):
         counter = collections.Counter({"wo\trd": 1})
@@ -322,3 +328,81 @@ class TestEndToEnd:
         run_pipeline(str(f), output_path=str(out), workers=1, force=True)
         content2 = out.read_text(encoding="utf-8")
         assert "测试" in content2
+
+    def test_pos_suffix(self, tmp_path):
+        from dict_seg.pipeline import run_pipeline
+        from dict_seg.config import OUTPUT_FILE_SUFFIX_POS
+
+        f = tmp_path / "corpus.txt"
+        f.write_text("测试测试测试测试测试测试\n" * 10, encoding="utf-8")
+        out = run_pipeline(str(f), no_pos=False, workers=1, min_freq=1, force=True)
+        assert OUTPUT_FILE_SUFFIX_POS in out
+
+    def test_pos_output_format(self, tmp_path):
+        from dict_seg.pipeline import run_pipeline
+
+        f = tmp_path / "corpus.txt"
+        f.write_text("测试测试测试测试测试测试\n" * 10, encoding="utf-8")
+        out = run_pipeline(str(f), no_pos=False, workers=1, min_freq=1, force=True)
+        lines = open(out, encoding="utf-8").readlines()
+        assert len(lines) > 0
+        # POS format: word\tpos\tfreq (3 columns)
+        cols = lines[0].rstrip("\n").split("\t")
+        assert len(cols) == 3
+
+    def test_wordfreq_excluded_from_dir(self, tmp_path):
+        from dict_seg.pipeline import run_pipeline
+
+        d = tmp_path / "corpus_dir"
+        d.mkdir()
+        (d / "a.txt").write_text("测试文本\n" * 10, encoding="utf-8")
+        (d / "b.txt").write_text("品牌颜色\n" * 10, encoding="utf-8")
+        (d / "c_wordfreq.txt").write_text("existing\t100\n", encoding="utf-8")
+
+        out = run_pipeline(str(d), workers=1, min_freq=1, force=True)
+        # c_wordfreq.txt should be excluded, only a.txt and b.txt processed
+        result = open(out, encoding="utf-8").read()
+        assert "existing" not in result
+
+
+class TestMergeWordfreq:
+    def test_merge_non_pos(self, tmp_path):
+        from dict_seg.pipeline import merge_wordfreq_files
+
+        d = tmp_path / "freqs"
+        d.mkdir()
+        (d / "a_wordfreq.txt").write_text("品牌\t5\n颜色\t3\n", encoding="utf-8")
+        (d / "b_wordfreq.txt").write_text("品牌\t2\n材质\t4\n", encoding="utf-8")
+
+        out = merge_wordfreq_files(str(d), min_freq=1, force=True)
+        result = {}
+        for line in open(out, encoding="utf-8"):
+            w, f = line.strip().split("\t")
+            result[w] = int(f)
+        assert result["品牌"] == 7
+        assert result["颜色"] == 3
+        assert result["材质"] == 4
+
+    def test_merge_pos(self, tmp_path):
+        from dict_seg.pipeline import merge_wordfreq_files
+
+        d = tmp_path / "freqs"
+        d.mkdir()
+        (d / "a_wordfreq.txt").write_text("品牌\tn\t5\n颜色\tn\t3\n", encoding="utf-8")
+        (d / "b_wordfreq.txt").write_text("品牌\tn\t2\n材质\tn\t4\n", encoding="utf-8")
+
+        out = merge_wordfreq_files(str(d), no_pos=False, min_freq=1, force=True)
+        lines = [l.strip().split("\t") for l in open(out, encoding="utf-8")]
+        assert len(lines[0]) == 3  # word\tpos\tfreq
+
+    def test_merge_suffix_pos(self, tmp_path):
+        from dict_seg.pipeline import merge_wordfreq_files
+        from dict_seg.config import OUTPUT_FILE_SUFFIX_POS
+
+        d = tmp_path / "freqs"
+        d.mkdir()
+        (d / "a_wordfreq.txt").write_text("品牌\tn\t5\n", encoding="utf-8")
+        (d / "b_wordfreq.txt").write_text("品牌\tn\t2\n", encoding="utf-8")
+
+        out = merge_wordfreq_files(str(d), no_pos=False, min_freq=1, force=True)
+        assert OUTPUT_FILE_SUFFIX_POS in out

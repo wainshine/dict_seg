@@ -15,13 +15,14 @@ import tqdm
 from .config import (
     DEFAULT_MEM_MB, WORKERS, MIN_FREQ, CHUNK_LINES, CHUNKS_PER_BATCH,
     SINGLE_LINE_CHAR_CHUNK, BYTE_BUF, TEXT_EXTENSIONS, OUTPUT_FILE_SUFFIX,
+    OUTPUT_FILE_SUFFIX_POS,
 )
 from .segment import cut_and_count, cut_and_count_pos
 from .segment import cut_and_count_text, cut_and_count_text_pos
 
 _SORT_BIN = "gsort" if shutil.which("gsort") else "sort"
 _SORT_IS_GNU = _SORT_BIN == "gsort"
-_CHINESE_RE = re.compile(r"[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]")
+_CHINESE_RE = re.compile(r"[\u4E00-\u9FFF]")
 
 _running_sorts: list[subprocess.Popen] = []
 
@@ -72,17 +73,18 @@ def _collect_files(path: str) -> list[str]:
     raise FileNotFoundError(f"Path not found: {path}")
 
 
-def _make_output_path(input_path: str) -> str:
+def _make_output_path(input_path: str, suffix: str | None = None) -> str:
+    suf = suffix or OUTPUT_FILE_SUFFIX
     today = date.today().strftime("%Y%m%d")
     if os.path.isfile(input_path):
         stem = os.path.splitext(os.path.basename(input_path))[0]
         return os.path.join(
             os.path.dirname(input_path) or ".",
-            f"{stem}_{today}_{OUTPUT_FILE_SUFFIX}",
+            f"{stem}_{today}_{suf}",
         )
     else:
         name = os.path.basename(input_path.rstrip("/"))
-        return os.path.join(input_path, f"{name}_{today}_{OUTPUT_FILE_SUFFIX}")
+        return os.path.join(input_path, f"{name}_{today}_{suf}")
 
 
 # ── Encoding detection ───────────────────────────────────────────
@@ -97,11 +99,7 @@ def _detect_file_encoding(filepath: str) -> str:
             return "utf-8"
     except UnicodeDecodeError:
         text = sample.decode("utf-8", errors="replace")
-        ch = sum(1 for c in text
-                 if any(lo <= ord(c) <= hi
-                        for lo, hi in ((0x3400, 0x4DBF),
-                                       (0x4E00, 0x9FFF),
-                                       (0xF900, 0xFAFF))))
+        ch = sum(1 for c in text if 0x4E00 <= ord(c) <= 0x9FFF)
         if len(text) > 0 and ch > len(text) * 0.005:
             return "utf-8"
 
@@ -113,10 +111,7 @@ def _detect_file_encoding(filepath: str) -> str:
         try:
             text = sample.decode(enc, errors="replace")
             ch = sum(1 for c in text
-                 if any(lo <= ord(c) <= hi
-                        for lo, hi in ((0x3400, 0x4DBF),
-                                       (0x4E00, 0x9FFF),
-                                       (0xF900, 0xFAFF))))
+                 if 0x4E00 <= ord(c) <= 0x9FFF)
             ratio = ch / len(text) if len(text) > 0 else 0
             if ratio > best_ratio:
                 best_ratio = ratio
@@ -239,8 +234,8 @@ def _merge_sorted_word_counts(input_path: str, output_path: str,
                     pos_counts[pos] = pos_counts.get(pos, 0) + cnt
                 else:
                     if prev_word is not None:
-                        best_pos = max(pos_counts, key=pos_counts.get)
-                        fout.write(f"{prev_word}\t{total_freq}\t{best_pos}\n")
+                        best_pos = max(pos_counts, key=pos_counts.get) if pos_counts else "?"
+                        fout.write(f"{prev_word}\t{best_pos}\t{total_freq}\n")
                         count += 1
                     prev_word = word
                     total_freq = cnt
@@ -250,7 +245,7 @@ def _merge_sorted_word_counts(input_path: str, output_path: str,
                 fout.write(f"{prev_word}\t{total_freq}\n")
             else:
                 best_pos = max(pos_counts, key=pos_counts.get)
-                fout.write(f"{prev_word}\t{total_freq}\t{best_pos}\n")
+                fout.write(f"{prev_word}\t{best_pos}\t{total_freq}\n")
             count += 1
     return count
 
@@ -267,19 +262,20 @@ def run_pipeline(
     strip_html: bool = False,
     force: bool = False,
 ) -> str:
-    # Ensure fork-based multiprocessing for robustness
-    if sys.platform != "win32":
-        try:
-            set_start_method("fork")
-        except RuntimeError:
-            pass  # already set
+    # Use spawn on macOS (fork can deadlock with jieba.posseg)
+    if sys.platform == "darwin":
+        set_start_method("spawn", force=True)
     txt_files = _collect_files(input_path)
+    # Exclude existing wordfreq output so it doesn't feed back in
+    txt_files = [f for f in txt_files
+                 if "wordfreq" not in os.path.basename(f)]
     total_size = sum(os.path.getsize(fp) for fp in txt_files)
     print(f"Found {len(txt_files)} text file(s) "
           f"({total_size / 1e9:.1f} GB)")
 
     if output_path is None:
-        output_path = _make_output_path(input_path)
+        output_path = _make_output_path(input_path,
+                                         OUTPUT_FILE_SUFFIX_POS if not no_pos else None)
     if os.path.exists(output_path) and not force:
         print(f"  Output exists: {output_path}. Use --force to overwrite.")
         return output_path
@@ -376,7 +372,7 @@ def run_pipeline(
                 if no_pos:
                     f.write("word\tfreq\n")
                 else:
-                    f.write("word\tfreq\tpos\n")
+                    f.write("word\tpos\tfreq\n")
             return output_path
 
         merged_unsorted = os.path.join(temp_dir, "merged_unsorted.txt")
@@ -440,7 +436,7 @@ def run_pipeline(
             for line in fin:
                 parts = line.rstrip("\n\r").split("\t")
                 w = parts[0]
-                freq_s = parts[1]
+                freq_s = parts[-1]  # last column is always freq
                 if int(freq_s) < min_freq:
                     continue
                 if not _has_chinese(w):
@@ -448,9 +444,114 @@ def run_pipeline(
                 fout.write(line)
 
         print("  Sorting by frequency descending...")
+        sort_key = "-k2,2" if no_pos else "-k3,3"
         subprocess.run(
             _make_sort_cmd(mem_mb, workers,
-                           "-t", "\t", "-k2,2", "-nr",
+                           "-t", "\t", sort_key, "-nr",
+                           "-o", output_path, filtered_path),
+            check=True,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+
+        print(f"Done: {output_path}")
+        return output_path
+
+    finally:
+        _kill_running_sorts()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# ── Wordfreq merge ───────────────────────────────────────────────
+
+def merge_wordfreq_files(
+    input_path: str,
+    output_path: str | None = None,
+    mem_mb: int = DEFAULT_MEM_MB,
+    workers: int = WORKERS,
+    min_freq: int = MIN_FREQ,
+    no_pos: bool = True,
+    force: bool = False,
+) -> str:
+    """Merge multiple _wordfreq.txt files from a directory into one.
+
+    input_path can be a directory containing _wordfreq.txt files,
+    or multiple file paths will be auto-collected via _collect_files.
+    """
+    txt_files = _collect_files(input_path)
+    txt_files = [f for f in txt_files
+                 if "wordfreq" in os.path.basename(f)
+                 and "merged" not in os.path.basename(f)]
+    if len(txt_files) < 2:
+        print(f"  Need >= 2 wordfreq files, found {len(txt_files)}")
+        if txt_files and output_path:
+            shutil.copy(txt_files[0], output_path)
+        return output_path or ""
+
+    total_size = sum(os.path.getsize(fp) for fp in txt_files)
+    print(f"Found {len(txt_files)} wordfreq file(s) "
+          f"({total_size / 1e9:.2f} GB)")
+
+    if output_path is None:
+        today = date.today().strftime("%Y%m%d")
+        suf = OUTPUT_FILE_SUFFIX_POS if not no_pos else OUTPUT_FILE_SUFFIX
+        output_path = os.path.join(input_path, f"merged_{today}_{suf}")
+
+    if os.path.exists(output_path) and not force:
+        print(f"  Output exists: {output_path}. Use --force to overwrite.")
+        return output_path
+
+    temp_dir = tempfile.mkdtemp(prefix="dict_seg_merge_")
+    merged_path = os.path.join(temp_dir, "merged.txt")
+
+    try:
+        merged_unsorted = os.path.join(temp_dir, "merged_unsorted.txt")
+        print(f"  Concatenating {len(txt_files)} wordfreq files...")
+        with open(merged_unsorted, "wb") as out:
+            for tp in txt_files:
+                with open(tp, "rb") as f:
+                    shutil.copyfileobj(f, out)
+
+        sort_env = {**os.environ, "LC_ALL": "C"}
+        p = subprocess.Popen(
+            _make_sort_cmd(mem_mb, workers,
+                           "-t", "\t", "-k1,1",
+                           "-o", merged_path, merged_unsorted),
+            stderr=subprocess.PIPE, text=True, env=sort_env)
+        _running_sorts.append(p)
+        _, stderr = p.communicate()
+        if p.returncode != 0:
+            raise RuntimeError(f"Sort failed: {stderr}")
+
+        try:
+            os.remove(merged_unsorted)
+        except OSError:
+            pass
+
+        print("  Merging same-word counts...")
+        merged_unsorted2 = os.path.join(temp_dir, "merged_unsorted2.txt")
+        word_count = _merge_sorted_word_counts(merged_path, merged_unsorted2,
+                                               no_pos)
+        print(f"  Unique words after merge: {word_count}")
+
+        print(f"  Filtering Chinese-only, min_freq >= {min_freq}...")
+        filtered_path = os.path.join(temp_dir, "filtered.txt")
+        with open(merged_unsorted2, "r", encoding="utf-8") as fin, \
+             open(filtered_path, "w", encoding="utf-8") as fout:
+            for line in fin:
+                parts = line.rstrip("\n\r").split("\t")
+                w = parts[0]
+                freq_s = parts[-1]  # last column is always freq
+                if int(freq_s) < min_freq:
+                    continue
+                if not _has_chinese(w):
+                    continue
+                fout.write(line)
+
+        print("  Sorting by frequency descending...")
+        sort_key = "-k2,2" if no_pos else "-k3,3"
+        subprocess.run(
+            _make_sort_cmd(mem_mb, workers,
+                           "-t", "\t", sort_key, "-nr",
                            "-o", output_path, filtered_path),
             check=True,
             env={**os.environ, "LC_ALL": "C"},

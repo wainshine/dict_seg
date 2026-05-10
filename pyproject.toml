@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dict-seg"
-version = "1.0.0"
+version = "1.1.0"
 description = "Batch Chinese word segmentation + word frequency counting with jieba"
 authors = [{ name = "wainshine" }]
 license = { text = "Apache-2.0" }
@@ -20,6 +20,7 @@ dependencies = [
 
 [project.scripts]
 dict-seg = "dict_seg.__main__:main"
+dict-seg-merge = "dict_seg.__main__:merge"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]

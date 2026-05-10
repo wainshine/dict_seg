@@ -2,6 +2,7 @@ from multiprocessing import cpu_count
 
 # Output file suffix appended as {name}_{date}_{suffix}
 OUTPUT_FILE_SUFFIX = "wordfreq.txt"
+OUTPUT_FILE_SUFFIX_POS = "pos_wordfreq.txt"
 
 # Memory budget (MB) for external sort subprocess
 DEFAULT_MEM_MB = 1024
