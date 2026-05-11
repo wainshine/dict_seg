@@ -22,6 +22,8 @@ from .pipeline import run_pipeline, merge_wordfreq_files
               help="Path to custom jieba dictionary file.")
 @click.option("--force", is_flag=True, default=False,
               help="Overwrite output file if it already exists.")
+@click.option("--pre-seg", is_flag=True, default=False,
+              help="Input is already pre-segmented (tab-separated tokens).")
 @click.version_option(version="1.2.0", prog_name="dict-seg")
 def main(
     input_path: str,
@@ -32,6 +34,7 @@ def main(
     pos: bool,
     strip_html: bool,
     user_dict: str | None,
+    pre_seg: bool,
     force: bool,
 ) -> None:
     """Batch Chinese word segmentation with jieba and word frequency counting.
@@ -53,6 +56,7 @@ def main(
         use_pos=pos,
         strip_html=strip_html,
         user_dict=user_dict,
+        pre_seg=pre_seg,
         force=force,
     )
 

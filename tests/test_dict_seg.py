@@ -14,6 +14,8 @@ from dict_seg.config import (
 )
 from dict_seg.segment import _is_garbage, cut_and_count, cut_and_count_pos
 from dict_seg.segment import cut_and_count_text, cut_and_count_text_pos
+from dict_seg.segment import count_presegmented, count_presegmented_text
+from dict_seg.segment import count_presegmented_pos, count_presegmented_text_pos
 from dict_seg.pipeline import (
     _collect_files,
     _make_output_path,
@@ -101,6 +103,65 @@ class TestPosCutAndCount:
         assert len(keys) > 0
         assert isinstance(keys[0], tuple)
         assert len(keys[0]) == 2  # (word, pos)
+
+
+class TestCountPresegmented:
+    def test_basic(self):
+        counter = count_presegmented(["品牌\t颜色\t材质\t"])
+        assert counter["品牌"] == 1
+        assert counter["颜色"] == 1
+        assert counter["材质"] == 1
+
+    def test_strips_whitespace(self):
+        counter = count_presegmented([" 品牌 \t 颜色 "])
+        assert counter["品牌"] == 1
+        assert counter["颜色"] == 1
+
+    def test_garbage_filtered(self):
+        counter = count_presegmented(["item_id\t35190107271\tT1Z0eVXy8iXXXXXXXX\t品牌"])
+        assert "35190107271" not in counter
+        assert "T1Z0eVXy8iXXXXXXXX" not in counter
+        assert "品牌" in counter
+
+    def test_empty_tokens_skipped(self):
+        counter = count_presegmented(["\t\t品牌\t\t"])
+        assert len(counter) == 1
+        assert counter["品牌"] == 1
+
+    def test_multiple_lines(self):
+        counter = count_presegmented(["品牌\t颜色", "品牌\t材质"])
+        assert counter["品牌"] == 2
+        assert counter["颜色"] == 1
+        assert counter["材质"] == 1
+
+
+class TestCountPresegmentedPos:
+    def test_known_word_gets_pos(self):
+        counter = count_presegmented_pos(["品牌\t颜色\t材质"])
+        assert len(counter) > 0
+        for (w, pos), _ in counter.items():
+            assert isinstance(w, str)
+            assert isinstance(pos, str)
+
+    def test_unknown_word_gets_x(self):
+        counter = count_presegmented_pos(["abcd1234xyz"])
+        assert len(counter) > 0
+        key = list(counter.keys())[0]
+        assert key[0] == "abcd1234xyz"
+        assert key[1] == "x"
+
+    def test_garbage_filtered(self):
+        counter = count_presegmented_pos(["35190107271\tT1Z0eVXy8iXXXXXXXX\t品牌\t颜色"])
+        keys = {k[0] for k in counter.keys()}
+        assert "35190107271" not in keys
+        assert "T1Z0eVXy8iXXXXXXXX" not in keys
+        assert "品牌" in keys or "颜色" in keys
+
+    def test_counter_keys_are_tuples(self):
+        counter = count_presegmented_pos(["测试\t品牌"])
+        for k in counter.keys():
+            assert isinstance(k, tuple)
+            assert len(k) == 2
 
 
 # ── pipeline.py: utility function tests ───────────────────────────

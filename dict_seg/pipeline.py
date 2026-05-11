@@ -19,6 +19,8 @@ from .config import (
 )
 from .segment import cut_and_count, cut_and_count_pos
 from .segment import cut_and_count_text, cut_and_count_text_pos
+from .segment import count_presegmented, count_presegmented_text
+from .segment import count_presegmented_pos, count_presegmented_text_pos
 
 _SORT_BIN = "gsort" if shutil.which("gsort") else "sort"
 _SORT_IS_GNU = _SORT_BIN == "gsort"
@@ -96,12 +98,14 @@ def _filter_and_sort_final(merged_path: str, output_path: str,
     )
 
 
-def _segment_worker(args: tuple[list[str], str, bool, bool, str | None]) -> None:
-    lines, tmp_path, use_pos, strip_html, user_dict = args
+def _segment_worker(args: tuple[list[str], str, bool, bool, str | None, bool]) -> None:
+    lines, tmp_path, use_pos, strip_html, user_dict, pre_seg = args
     if user_dict:
         import jieba
         jieba.load_userdict(user_dict)
-    if not use_pos:
+    if pre_seg:
+        counter = count_presegmented_pos(lines) if use_pos else count_presegmented(lines)
+    elif not use_pos:
         counter = cut_and_count(lines, strip_html=strip_html)
     else:
         counter = cut_and_count_pos(lines, strip_html=strip_html)
@@ -315,6 +319,7 @@ def run_pipeline(
     use_pos: bool = False,
     strip_html: bool = False,
     user_dict: str | None = None,
+    pre_seg: bool = False,
     force: bool = False,
 ) -> str:
     # Use spawn on macOS (fork can deadlock with jieba.posseg)
@@ -414,7 +419,7 @@ def run_pipeline(
                             futures.append(pool.apply_async(
                                 _segment_worker,
                                 ((batch_lines, tmp_path, use_pos,
-                                  strip_html, user_dict),),
+                                  strip_html, user_dict, pre_seg),),
                             ))
                             chunks_per_task.append(batch_chunks)
                             batch_lines = []
@@ -428,7 +433,7 @@ def run_pipeline(
                     futures.append(pool.apply_async(
                         _segment_worker,
                         ((batch_lines, tmp_path, use_pos, strip_html,
-                          user_dict),),
+                          user_dict, pre_seg),),
                     ))
                     chunks_per_task.append(batch_chunks)
 
@@ -446,7 +451,8 @@ def run_pipeline(
                 print(f"  Single-line mode: {os.path.basename(hf)} "
                       f"({os.path.getsize(hf) / 1e9:.1f} GB)")
                 sl_tmp, batch_id = _process_single_line_file(
-                    hf, chunk_tmp_dir, batch_id, use_pos, strip_html)
+                    hf, chunk_tmp_dir, batch_id, use_pos, strip_html,
+                    pre_seg)
                 tmp_paths.extend(sl_tmp)
             except Exception:
                 print(f"  WARNING: Failed processing {hf}, skipping.")
@@ -611,6 +617,7 @@ def _process_single_line_file(
     start_id: int,
     use_pos: bool,
     strip_html: bool,
+    pre_seg: bool = False,
 ) -> tuple[list[str], int]:
     encoding = _detect_file_encoding(filepath)
     total_bytes = os.path.getsize(filepath)
@@ -628,7 +635,10 @@ def _process_single_line_file(
     tmp_paths: list[str] = []
     pbar = tqdm.tqdm(total=total_chunks, desc="  S-line", unit="chunk")
 
-    cut_func = cut_and_count_text if not use_pos else cut_and_count_text_pos
+    if pre_seg:
+        cut_func = count_presegmented_text_pos if use_pos else count_presegmented_text
+    else:
+        cut_func = cut_and_count_text if not use_pos else cut_and_count_text_pos
     carryover = b""
     batch_id = start_id
     with open(filepath, "rb") as fin:
