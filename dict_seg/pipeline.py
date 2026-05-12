@@ -15,10 +15,9 @@ import tqdm
 from .config import (
     DEFAULT_MEM_MB, WORKERS, MIN_FREQ, CHUNK_LINES, CHUNKS_PER_BATCH,
     SINGLE_LINE_CHAR_CHUNK, BYTE_BUF, TEXT_EXTENSIONS, OUTPUT_FILE_SUFFIX,
-    OUTPUT_FILE_SUFFIX_POS,
+    OUTPUT_FILE_SUFFIX_POS, MAX_CHUNK_CHARS,
 )
 from .segment import cut_and_count, cut_and_count_pos
-from .segment import cut_and_count_text, cut_and_count_text_pos
 from .segment import count_presegmented, count_presegmented_text
 from .segment import count_presegmented_pos, count_presegmented_text_pos
 
@@ -28,6 +27,57 @@ _CHINESE_RE = re.compile(r"[\u4E00-\u9FFF]")
 _WORKER_TIMEOUT = 600
 
 _running_sorts: list[subprocess.Popen] = []
+
+
+def _split_file_to_dir(filepath: str, output_dir: str,
+                       approx_bytes: int = 500 * 1024 * 1024) -> list[str]:
+    encoding = _detect_file_encoding(filepath)
+    char_limit = max(100_000, approx_bytes // 3)
+    chunk_paths: list[str] = []
+    part = 0
+    carryover = b""
+    out = None
+    acc_chars = 0
+    basename = os.path.splitext(os.path.basename(filepath))[0]
+    with open(filepath, "rb") as fin:
+        while True:
+            data = fin.read(BYTE_BUF)
+            if not data:
+                if carryover and out:
+                    text = carryover.decode(encoding, errors="replace")
+                    out.write(text.encode("utf-8"))
+                break
+            segment = carryover + data
+            try:
+                text = segment.decode(encoding)
+                carryover = b""
+            except UnicodeDecodeError:
+                for cut in range(-1, -5, -1):
+                    try:
+                        text = segment[:cut].decode(encoding)
+                        carryover = segment[cut:]
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                else:
+                    text = segment.decode(encoding, errors="replace")
+                    carryover = b""
+            for i in range(0, len(text), char_limit):
+                piece = text[i:i + char_limit]
+                encoded = piece.encode("utf-8")
+                if out is None or acc_chars + len(piece) > char_limit:
+                    if out:
+                        out.close()
+                    part += 1
+                    path = os.path.join(output_dir, f"{basename}_p{part:04d}.txt")
+                    chunk_paths.append(path)
+                    out = open(path, "wb")
+                    acc_chars = 0
+                out.write(encoded)
+                acc_chars += len(piece)
+    if out:
+        out.close()
+    return chunk_paths
 
 
 def _make_sort_cmd(mem_mb: int, workers: int, *args: str) -> list[str]:
@@ -209,6 +259,8 @@ def _is_single_line_file(filepath: str) -> bool:
             bytes_read += len(data)
             count += data.count(b"\n")
             if count > 10:
+                if bytes_read / count > 65536:
+                    return True
                 return False
     return count <= 10
 
@@ -217,12 +269,26 @@ def _is_single_line_file(filepath: str) -> bool:
 
 def _read_chunks_by_lines(path: str, n: int, encoding: str = "utf-8") -> "collections.abc.Generator[list[str], None, None]":
     chunk: list[str] = []
+    chunk_chars = 0
+    max_line_chars = SINGLE_LINE_CHAR_CHUNK
     with open(path, "r", encoding=encoding, errors="replace") as f:
         for line in f:
-            chunk.append(line)
-            if len(chunk) >= n:
-                yield chunk
-                chunk = []
+            if len(line) > max_line_chars:
+                for i in range(0, len(line), max_line_chars):
+                    sub = line[i:i + max_line_chars]
+                    chunk.append(sub)
+                    chunk_chars += len(sub)
+                    if len(chunk) >= n or chunk_chars >= MAX_CHUNK_CHARS:
+                        yield chunk
+                        chunk = []
+                        chunk_chars = 0
+            else:
+                chunk.append(line)
+                chunk_chars += len(line)
+                if len(chunk) >= n or chunk_chars >= MAX_CHUNK_CHARS:
+                    yield chunk
+                    chunk = []
+                    chunk_chars = 0
         if chunk:
             yield chunk
 
@@ -353,6 +419,16 @@ def run_pipeline(
         huge_files = [f for f in txt_files if _is_single_line_file(f)]
         normal_files = [f for f in txt_files if f not in huge_files]
 
+        if huge_files:
+            split_dir = os.path.join(temp_dir, "split")
+            os.makedirs(split_dir, exist_ok=True)
+            for hf in huge_files:
+                print(f"  Splitting: {os.path.basename(hf)} "
+                      f"({os.path.getsize(hf) / 1e9:.1f} GB) into 500MB chunks...")
+                chunks = _split_file_to_dir(hf, split_dir)
+                normal_files.extend(chunks)
+                print(f"    -> {len(chunks)} chunk files")
+
         tmp_paths: list[str] = []
         batch_id = 0
 
@@ -445,17 +521,6 @@ def run_pipeline(
                         raise
                     pbar.update(n)
                 pbar.close()
-
-        for hf in huge_files:
-            try:
-                print(f"  Single-line mode: {os.path.basename(hf)} "
-                      f"({os.path.getsize(hf) / 1e9:.1f} GB)")
-                sl_tmp, batch_id = _process_single_line_file(
-                    hf, chunk_tmp_dir, batch_id, use_pos, strip_html,
-                    pre_seg)
-                tmp_paths.extend(sl_tmp)
-            except Exception:
-                print(f"  WARNING: Failed processing {hf}, skipping.")
 
         # ── Stage 2: Concat + sort + merge ───────────────────────
         if not tmp_paths:
@@ -607,79 +672,3 @@ def merge_wordfreq_files(
     finally:
         _kill_running_sorts()
         shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-# ── Single-line file processing ──────────────────────────────────
-
-def _process_single_line_file(
-    filepath: str,
-    chunk_tmp_dir: str,
-    start_id: int,
-    use_pos: bool,
-    strip_html: bool,
-    pre_seg: bool = False,
-) -> tuple[list[str], int]:
-    encoding = _detect_file_encoding(filepath)
-    total_bytes = os.path.getsize(filepath)
-    bytes_per_char = 2 if encoding in ("gb18030", "gbk", "big5") else 3
-    with open(filepath, "rb") as sf:
-        probe = sf.read(BYTE_BUF)
-    if probe:
-        char_count = len(probe.decode(encoding, errors="replace"))
-        if char_count > 0:
-            bytes_per_char = max(1, total_bytes // char_count)
-    total_chunks = (
-        total_bytes // (SINGLE_LINE_CHAR_CHUNK * bytes_per_char) + 1
-    )
-
-    tmp_paths: list[str] = []
-    pbar = tqdm.tqdm(total=total_chunks, desc="  S-line", unit="chunk")
-
-    if pre_seg:
-        cut_func = count_presegmented_text_pos if use_pos else count_presegmented_text
-    else:
-        cut_func = cut_and_count_text if not use_pos else cut_and_count_text_pos
-    carryover = b""
-    batch_id = start_id
-    with open(filepath, "rb") as fin:
-        while True:
-            data = fin.read(BYTE_BUF)
-            if not data:
-                if carryover:
-                    text = carryover.decode(encoding, errors="replace")
-                    counter = cut_func(text, strip_html=strip_html)
-                    tmp_path = os.path.join(
-                        chunk_tmp_dir, f"chunk_{batch_id:06d}.txt")
-                    _write_counter_to_file(counter, tmp_path, use_pos)
-                    tmp_paths.append(tmp_path)
-                    pbar.update(1)
-                break
-
-            segment = carryover + data
-            try:
-                text = segment.decode(encoding)
-                carryover = b""
-            except UnicodeDecodeError:
-                for cut in range(-1, -5, -1):
-                    try:
-                        text = segment[:cut].decode(encoding)
-                        carryover = segment[cut:]
-                        break
-                    except UnicodeDecodeError:
-                        continue
-                else:
-                    text = segment.decode(encoding, errors="replace")
-                    carryover = b""
-
-            for i in range(0, len(text), SINGLE_LINE_CHAR_CHUNK):
-                sub = text[i:i + SINGLE_LINE_CHAR_CHUNK]
-                counter = cut_func(sub, strip_html=strip_html)
-                tmp_path = os.path.join(
-                    chunk_tmp_dir, f"chunk_{batch_id:06d}.txt")
-                _write_counter_to_file(counter, tmp_path, use_pos)
-                tmp_paths.append(tmp_path)
-                batch_id += 1
-                pbar.update(1)
-
-        pbar.close()
-    return tmp_paths, batch_id

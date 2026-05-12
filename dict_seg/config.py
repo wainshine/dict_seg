@@ -43,6 +43,9 @@ WORKERS = max(1, _RAW_COUNT // 2)
 # Lines per raw chunk read from file (~500KB at 100 bytes/line)
 CHUNK_LINES = 5_000
 
+# Max characters per chunk (alongside CHUNK_LINES); triggers yield when exceeded
+MAX_CHUNK_CHARS = 2_000_000
+
 # Number of raw chunks grouped into one worker batch (~50K lines per batch)
 CHUNKS_PER_BATCH = 10
 

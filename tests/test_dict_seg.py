@@ -26,6 +26,8 @@ from dict_seg.pipeline import (
     _write_counter_to_file,
     _make_sort_cmd,
     _filter_and_sort_final,
+    _read_chunks_by_lines,
+    _split_file_to_dir,
 )
 from dict_seg.__main__ import main, merge
 
@@ -581,19 +583,78 @@ class TestIsSingleLineFileCap:
         monkeypatch.setattr("os.path.getsize", lambda p: 800 * 1024 * 1024)
         assert not _is_single_line_file("/fake/large.bin")
 
+    def test_long_avg_lines_detected(self, monkeypatch):
+        data = b"a" * (700 * 1024) + b"\n" + b"b" * (700 * 1024) + b"\n"
+        def fake_open(path, mode):
+            return io.BytesIO(data)
+        monkeypatch.setattr("builtins.open", fake_open)
+        monkeypatch.setattr("os.path.getsize", lambda p: 800 * 1024 * 1024)
+        assert _is_single_line_file("/fake/longlines.bin")
+
+
+class TestReadChunksByLines:
+    def test_normal_lines(self, tmp_path):
+        f = tmp_path / "test.txt"
+        f.write_text("a\nb\nc\nd\ne\nf\n", encoding="utf-8")
+        chunks = list(_read_chunks_by_lines(str(f), n=3))
+        assert len(chunks) == 2
+        assert len(chunks[0]) == 3
+        assert len(chunks[1]) == 3
+
+    def test_long_line_split(self, tmp_path):
+        f = tmp_path / "test.txt"
+        big_line = "x" * 300_000 + "\n"
+        f.write_text(big_line, encoding="utf-8")
+        chunks = list(_read_chunks_by_lines(str(f), n=5000))
+        assert len(chunks) == 1
+        assert len(chunks[0]) == 2
+        assert len(chunks[0][0]) <= 200_000
+
+    def test_char_limit_triggers_yield(self, tmp_path):
+        f = tmp_path / "test.txt"
+        lines = [f"line{i:04d}\n" for i in range(5000)]
+        f.write_text("".join(lines), encoding="utf-8")
+        chunks = list(_read_chunks_by_lines(str(f), n=5000))
+        assert len(chunks) >= 1
+
+
+class TestSplitFileToDir:
+    def test_split_normal_file(self, tmp_path):
+        f = tmp_path / "big.txt"
+        content = "hello world\n" * 100_000
+        f.write_text(content, encoding="utf-8")
+        out_dir = tmp_path / "split"
+        out_dir.mkdir()
+        paths = _split_file_to_dir(str(f), str(out_dir), approx_bytes=500_000)
+        assert len(paths) >= 2
+        total = sum(os.path.getsize(p) for p in paths)
+        assert total > 0
+
+    def test_split_encoding_handling(self, tmp_path):
+        f = tmp_path / "big.txt"
+        content = "你好世界\n" * 50_000
+        f.write_text(content, encoding="utf-8")
+        out_dir = tmp_path / "split"
+        out_dir.mkdir()
+        paths = _split_file_to_dir(str(f), str(out_dir), approx_bytes=500_000)
+        assert len(paths) >= 1
+        for p in paths:
+            text = open(p, encoding="utf-8").read()
+            assert "你好" in text
+
 
 class TestCLI:
     def test_version(self):
         runner = CliRunner()
         result = runner.invoke(main, ["--version"])
         assert result.exit_code == 0
-        assert "1.2.0" in result.output
+        assert "1.3.0" in result.output
 
     def test_merge_version(self):
         runner = CliRunner()
         result = runner.invoke(merge, ["--version"])
         assert result.exit_code == 0
-        assert "1.2.0" in result.output
+        assert "1.3.0" in result.output
 
     def test_user_dict(self, tmp_path):
         corpus = tmp_path / "corpus.txt"

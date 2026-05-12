@@ -24,7 +24,7 @@ from .pipeline import run_pipeline, merge_wordfreq_files
               help="Overwrite output file if it already exists.")
 @click.option("--pre-seg", is_flag=True, default=False,
               help="Input is already pre-segmented (tab-separated tokens).")
-@click.version_option(version="1.2.0", prog_name="dict-seg")
+@click.version_option(version="1.3.0", prog_name="dict-seg")
 def main(
     input_path: str,
     output: str | None,
@@ -75,7 +75,7 @@ def main(
               help="Input files have POS column (word\\tpos\\tfreq).")
 @click.option("--force", is_flag=True, default=False,
               help="Overwrite output file if it already exists.")
-@click.version_option(version="1.2.0", prog_name="dict-seg-merge")
+@click.version_option(version="1.3.0", prog_name="dict-seg-merge")
 def merge(
     input_path: str,
     output: str | None,
